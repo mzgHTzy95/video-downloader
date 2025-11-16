@@ -14,6 +14,7 @@ import ctypes
 from queue import Queue
 from packaging import version
 from PIL import Image, ImageTk
+import glob
 
 
 class DownloadTask:
@@ -25,10 +26,12 @@ class DownloadTask:
         self.thread = None
         self.cancel_flag = False
         self.pause_flag = False
+        self.video_title = ""  # Store video title for cleanup
+        self.partial_files = []  # Track partial download files
 
 
 class VideoDownloader:
-    VERSION = "2.0.2"
+    VERSION = "2.1.4"
     GITHUB_REPO = "yourusername/repository-name"
 
     def __init__(self, root):
@@ -44,10 +47,13 @@ class VideoDownloader:
         self.download_queue = Queue()
         self.playlist_videos = []  # Store playlist video information
         self.selected_playlist_videos = []  # Store selected videos from playlist
+        self.available_qualities = (
+            []
+        )  # Store available quality options for current video/playlist
 
         self.set_windows_taskbar_icon()
         self.root.title(f"YouTube Video Downloader v{self.VERSION}")
-        self.root.geometry("800x750")
+        self.root.geometry("900x750")
         self.root.configure(bg="#F9F9F9")
 
         # Variables
@@ -239,7 +245,7 @@ class VideoDownloader:
 
         fetch_btn = tk.Button(
             url_input_frame,
-            text="Fetch Preview",
+            text="🔍",
             command=self.fetch_preview_threaded,
             font=("Segoe UI", 10),
             bg="#E0E0E0",
@@ -250,7 +256,7 @@ class VideoDownloader:
             pady=6,
         )
         fetch_btn.pack(side=tk.LEFT, padx=(8, 0))
-        
+
         # Playlist selection button (initially hidden)
         self.playlist_select_btn = tk.Button(
             url_input_frame,
@@ -304,24 +310,11 @@ class VideoDownloader:
         quality_options_frame = tk.Frame(quality_inner, bg=self.colors["card"])
         quality_options_frame.pack(fill=tk.X)
 
-        qualities = [
-            ("🏆 Best", "best"),
-            ("1080p", "1080"),
-            ("720p", "720"),
-            ("480p", "480"),
-            ("🎵 Audio", "audio"),
-        ]
+        # Default qualities (will be replaced with dynamic ones after preview)
+        self.quality_frame = quality_options_frame
+        self.quality_radios = []
 
-        for text, value in qualities:
-            tk.Radiobutton(
-                quality_options_frame,
-                text=text,
-                variable=self.quality_var,
-                value=value,
-                font=("Segoe UI", 10),
-                relief=tk.FLAT,
-                bd=0,
-            ).pack(side=tk.LEFT, padx=(0, 20))
+        self.setup_default_qualities()
 
         # path card
         path_card = tk.Frame(
@@ -391,37 +384,49 @@ class VideoDownloader:
             fg=self.colors["text_primary"],
             anchor="w",
         ).pack(side=tk.LEFT, fill=tk.X)
-        
+
         # Create scrollable area for downloads
         scroll_frame = tk.Frame(self.progress_content, bg=self.colors["card"])
         scroll_frame.pack(fill=tk.BOTH, expand=True, padx=15, pady=(5, 15))
-        
+
         # Canvas and scrollbar for downloads
         self.downloads_canvas = tk.Canvas(
             scroll_frame,
             bg=self.colors["card"],
             highlightthickness=0,
-            height=200  # Minimum height, will expand as needed
+            height=200,  # Minimum height, will expand as needed
         )
         downloads_scrollbar = ttk.Scrollbar(
-            scroll_frame,
-            orient="vertical",
-            command=self.downloads_canvas.yview
+            scroll_frame, orient="vertical", command=self.downloads_canvas.yview
         )
-        self.downloads_scrollable_frame = tk.Frame(self.downloads_canvas, bg=self.colors["card"])
-        
-        self.downloads_scrollable_frame.bind(
-            "<Configure>",
-            lambda e: self.downloads_canvas.configure(scrollregion=self.downloads_canvas.bbox("all"))
+        self.downloads_scrollable_frame = tk.Frame(
+            self.downloads_canvas, bg=self.colors["card"]
         )
-        
-        self.downloads_canvas.create_window((0, 0), window=self.downloads_scrollable_frame, anchor="nw")
+
+        def _configure_scroll_region(event):
+            try:
+                self.downloads_canvas.configure(
+                    scrollregion=self.downloads_canvas.bbox("all")
+                )
+                # Update canvas window to match frame width
+                canvas_width = self.downloads_canvas.winfo_width()
+                self.downloads_canvas.itemconfig(
+                    self.downloads_canvas_window, width=canvas_width
+                )
+            except:
+                pass
+
+        self.downloads_scrollable_frame.bind("<Configure>", _configure_scroll_region)
+
+        self.downloads_canvas_window = self.downloads_canvas.create_window(
+            (0, 0), window=self.downloads_scrollable_frame, anchor="nw"
+        )
         self.downloads_canvas.configure(yscrollcommand=downloads_scrollbar.set)
-        
+
         self.downloads_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         downloads_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        
-        # Bind mouse wheel to downloads canvas
+
+        # Bind mouse wheel to downloads canvas and frame
         def _on_downloads_mousewheel(event):
             try:
                 if event.num == 5 or getattr(event, "delta", 0) < 0:
@@ -430,10 +435,22 @@ class VideoDownloader:
                     self.downloads_canvas.yview_scroll(-1, "units")
             except tk.TclError:
                 pass
-        
+
+        # Bind to multiple widgets to ensure scrolling works
         self.downloads_canvas.bind("<MouseWheel>", _on_downloads_mousewheel)
         self.downloads_canvas.bind("<Button-4>", _on_downloads_mousewheel)
         self.downloads_canvas.bind("<Button-5>", _on_downloads_mousewheel)
+        self.downloads_scrollable_frame.bind("<MouseWheel>", _on_downloads_mousewheel)
+        self.downloads_scrollable_frame.bind("<Button-4>", _on_downloads_mousewheel)
+        self.downloads_scrollable_frame.bind("<Button-5>", _on_downloads_mousewheel)
+
+        # Also bind to the scroll_frame container
+        scroll_frame.bind("<MouseWheel>", _on_downloads_mousewheel)
+        scroll_frame.bind("<Button-4>", _on_downloads_mousewheel)
+        scroll_frame.bind("<Button-5>", _on_downloads_mousewheel)
+
+        # Set focus to canvas to enable keyboard navigation
+        self.downloads_canvas.focus_set()
 
         # Note: downloads_container is now self.downloads_scrollable_frame
 
@@ -457,7 +474,7 @@ class VideoDownloader:
         self.download_btn.pack(fill=tk.X, ipady=15)
 
         self.update_btn = tk.Button(
-            buttons_frame,
+            self.sidebar_inner,
             text="Check for Updates",
             command=self.manual_update_check,
             font=("Segoe UI", 9),
@@ -473,10 +490,6 @@ class VideoDownloader:
         scrollable_frame.columnconfigure(0, weight=1)
         scrollable_frame.rowconfigure(0, weight=1)
 
-    # ---------------------------
-    # Thumbnail / preview functions
-    # ---------------------------
-
     def fetch_preview_threaded(self):
         url = self.url_var.get().strip()
         if not url:
@@ -488,68 +501,104 @@ class VideoDownloader:
 
     def load_preview(self, url):
         """Fetch title, thumbnail, channel, duration using yt-dlp and requests in background."""
-        # default text while loading
-        self.root.after(0, lambda: self.sidebar_title.config(text="Loading preview..."))
+        # Show loading state
+        self.root.after(
+            0, lambda: self.sidebar_title.config(text="🔄 Loading preview...")
+        )
         self.root.after(
             0,
             lambda: self.thumbnail_label.config(
-                text="Loading thumbnail", image="", compound="center"
+                text="⏳ Loading thumbnail", image="", compound="center"
             ),
         )
-        self.root.after(0, lambda: self.sidebar_meta.config(text="Fetching info..."))
+        self.root.after(
+            0, lambda: self.sidebar_meta.config(text="Analyzing video formats...")
+        )
+
+        # Reset quality options to default while loading
+        self.root.after(0, lambda: self.setup_default_qualities())
 
         try:
-            # More robust yt-dlp options
+            # More robust yt-dlp options for better format extraction
             ydl_opts = {
-                "quiet": False,  # Enable output for debugging
+                "quiet": True,  # Reduce console spam
                 "no_warnings": False,
                 "nocheckcertificate": True,
-                "extract_flat": False,  # Don't extract flat playlist info
-                "ignoreerrors": True,  # Continue on download errors
+                "extract_flat": False,
+                "ignoreerrors": True,
+                "listformats": False,  # Don't list formats, just extract
+                "youtube_include_dash_manifest": True,
+                "writeinfojson": False,
             }
-            
-            print(f"Fetching preview for URL: {url}")  # Debug output
-            
+
+            print(f"🔍 Analyzing URL: {url}")  # Debug output
+
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
-            
+
             if not info:
-                raise Exception("No information extracted from URL")
-            
-            print(f"Info extracted successfully. Type: {'playlist' if 'entries' in info else 'video'}")  # Debug
+                raise Exception("Could not extract video information")
+
+            print(
+                f"✅ Successfully analyzed. Type: {'📋 Playlist' if 'entries' in info else '🎬 Video'}"
+            )  # Debug
+
+            # Extract available formats for quality detection
+            formats = info.get("formats", [])
+            if formats:
+                print(f"🎯 Found {len(formats)} available formats")
+                self.setup_dynamic_qualities(formats)
 
             # Check if it's a playlist
-            is_playlist = 'entries' in info and info['entries']
+            is_playlist = "entries" in info and info["entries"]
             self.playlist_detected = is_playlist
-            
+
             if is_playlist:
                 # It's a playlist
-                playlist_title = info.get('title', 'Unknown Playlist')
-                entries = [entry for entry in info.get('entries', []) if entry]  # Filter out None entries
+                playlist_title = info.get("title", "Unknown Playlist")
+                entries = [
+                    entry for entry in info.get("entries", []) if entry
+                ]  # Filter out None entries
                 self.playlist_videos = []
-                
-                print(f"Processing playlist with {len(entries)} videos")  # Debug
-                
+
+                print(f"📋 Processing playlist: {len(entries)} videos")
+
                 for entry in entries:
                     video_info = {
-                        'title': entry.get('title', 'Unknown'),
-                        'url': entry.get('webpage_url') or entry.get('url', '') or f"https://www.youtube.com/watch?v={entry.get('id', '')}",
-                        'duration': entry.get('duration', 0),
-                        'selected': True  # Default to selected
+                        "title": entry.get("title", "Unknown"),
+                        "url": entry.get("webpage_url")
+                        or entry.get("url", "")
+                        or f"https://www.youtube.com/watch?v={entry.get('id', '')}",
+                        "duration": entry.get("duration", 0),
+                        "selected": True,  # Default to selected
                     }
                     self.playlist_videos.append(video_info)
-                
+
                 # Update UI for playlist
-                self.root.after(0, lambda: self.sidebar_title.config(text=f"Playlist: {playlist_title}"))
-                self.root.after(0, lambda: self.sidebar_meta.config(text=f"Videos: {len(self.playlist_videos)}\nChannel: {info.get('uploader', 'Unknown')}"))
-                self.root.after(0, lambda: self.playlist_select_btn.pack(side=tk.LEFT, padx=(8, 0)))
-                self.root.after(0, lambda: self.thumbnail_label.config(text="📋 Playlist", image="", compound="center"))
+                self.root.after(
+                    0, lambda: self.sidebar_title.config(text=f"📋 {playlist_title}")
+                )
+                self.root.after(
+                    0,
+                    lambda: self.sidebar_meta.config(
+                        text=f"Videos: {len(self.playlist_videos)}\n📺 {info.get('uploader', 'Unknown')}"
+                    ),
+                )
+                self.root.after(
+                    0, lambda: self.playlist_select_btn.pack(side=tk.LEFT, padx=(8, 0))
+                )
+                self.root.after(
+                    0,
+                    lambda: self.thumbnail_label.config(
+                        text="📋 Playlist\nPreview", image="", compound="center"
+                    ),
+                )
                 return
             else:
                 # Single video
-                print(f"Processing single video: {info.get('title', 'Unknown')}")
+                print(f"🎬 Processing video: {info.get('title', 'Unknown')}")
                 self.root.after(0, lambda: self.playlist_select_btn.pack_forget())
-            
+
             title = info.get("title", "Unknown")
             duration = info.get("duration")
             duration_text = "--"
@@ -557,7 +606,12 @@ class VideoDownloader:
                 m, s = divmod(int(duration), 60)
                 h, m = divmod(m, 60)
                 duration_text = f"{h:d}h {m:d}m {s:d}s" if h else f"{m:d}m {s:d}s"
-            channel = info.get("uploader") or info.get("channel") or info.get("uploader_id") or "Unknown"
+            channel = (
+                info.get("uploader")
+                or info.get("channel")
+                or info.get("uploader_id")
+                or "Unknown"
+            )
             thumbnail_url = info.get("thumbnail")
 
             # schedule metadata update
@@ -569,15 +623,21 @@ class VideoDownloader:
             if thumbnail_url and Image and ImageTk:
                 try:
                     print(f"Loading thumbnail from: {thumbnail_url}")  # Debug
-                    r = requests.get(thumbnail_url, timeout=15, headers={
-                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-                    })
+                    r = requests.get(
+                        thumbnail_url,
+                        timeout=15,
+                        headers={
+                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                        },
+                    )
                     r.raise_for_status()
                     from io import BytesIO
 
                     img = Image.open(BytesIO(r.content))
                     # keep aspect, limit to sidebar width
-                    img.thumbnail((280, 180), Image.LANCZOS)  # Use LANCZOS instead of deprecated ANTIALIAS
+                    img.thumbnail(
+                        (280, 180), Image.LANCZOS
+                    )  # Use LANCZOS instead of deprecated ANTIALIAS
                     self.thumbnail_img = ImageTk.PhotoImage(img)
                     self.root.after(
                         0,
@@ -607,17 +667,18 @@ class VideoDownloader:
             # show failure with detailed error info
             print(f"Preview error: {str(e)}")  # Debug output
             import traceback
+
             traceback.print_exc()  # Print full traceback for debugging
-            
+
             self.playlist_detected = False
             error_msg = str(e)
             if len(error_msg) > 50:
                 error_msg = error_msg[:50] + "..."
-            
+
+            self.root.after(0, lambda: self.sidebar_title.config(text="Preview failed"))
             self.root.after(
-                0, lambda: self.sidebar_title.config(text="Preview failed")
+                0, lambda: self.sidebar_meta.config(text=f"Error: {error_msg}")
             )
-            self.root.after(0, lambda: self.sidebar_meta.config(text=f"Error: {error_msg}"))
             self.root.after(0, lambda: self.playlist_select_btn.pack_forget())
             self.root.after(
                 0,
@@ -717,17 +778,21 @@ class VideoDownloader:
         card = tk.Frame(parent, bg=self.colors["card"], bd=0)
         card.pack(fill=tk.X, padx=10, pady=10)
         card.configure(highlightbackground=self.colors["border"], highlightthickness=1)
-        
+
         # Update canvas scroll region after adding new card
         def update_scroll_region():
             try:
-                self.downloads_canvas.configure(scrollregion=self.downloads_canvas.bbox("all"))
+                self.downloads_canvas.configure(
+                    scrollregion=self.downloads_canvas.bbox("all")
+                )
                 # Scroll to bottom to show new download
                 self.downloads_canvas.yview_moveto(1.0)
             except:
                 pass
-        
-        self.root.after(100, update_scroll_region)  # Small delay to ensure card is rendered
+
+        self.root.after(
+            100, update_scroll_region
+        )  # Small delay to ensure card is rendered
 
         inner = tk.Frame(card, bg=self.colors["card"])
         inner.pack(fill=tk.X, padx=12, pady=12)
@@ -800,8 +865,8 @@ class VideoDownloader:
 
         pause_btn = tk.Button(
             btn_frame,
-            text="Pause",
-            bg="#fff176",
+            text="⏸️ Pause",
+            bg="#bf8200",
             fg="white",
             relief=tk.FLAT,
             bd=0,
@@ -850,7 +915,7 @@ class VideoDownloader:
             else:
                 task.pause_flag = True
                 try:
-                    task.ui["pause"].config(text="Resume")
+                    task.ui["pause"].config(text="▶️ Resume", bg="#00bf46")
                     task.ui["status"].config(text="Paused")
                 except Exception:
                     pass
@@ -865,29 +930,76 @@ class VideoDownloader:
                 task.ui["status"].config(text="Cancelling...", fg="#FF9800")
                 task.ui["cancel"].config(state=tk.DISABLED, bg="#CCCCCC", fg="#666666")
                 task.ui["pause"].config(state=tk.DISABLED, bg="#CCCCCC", fg="#666666")
+
+                # Clean up partial files in background
+                cleanup_thread = threading.Thread(
+                    target=self.cleanup_partial_files, args=(task,), daemon=True
+                )
+                cleanup_thread.start()
+
             except Exception:
                 pass
 
         self.root.after(0, do_cancel)
-    
+
+    def cleanup_partial_files(self, task):
+        """Clean up partial download files when cancelled"""
+        try:
+            # Wait a moment for the download to fully stop
+            time.sleep(2)
+
+            if task.video_title and task.path:
+                # Look for partial files with the video title
+                base_name = task.video_title
+                search_patterns = [
+                    os.path.join(task.path, f"{base_name}*.part"),
+                    os.path.join(
+                        task.path, f"{base_name}*.f*"
+                    ),  # Format-specific files
+                    os.path.join(task.path, f"{base_name}*.temp"),
+                    os.path.join(
+                        task.path, f"*{base_name[:20]}*.part"
+                    ),  # Partial name match
+                ]
+
+                files_deleted = []
+                for pattern in search_patterns:
+                    for file_path in glob.glob(pattern):
+                        try:
+                            if os.path.exists(file_path):
+                                os.remove(file_path)
+                                files_deleted.append(os.path.basename(file_path))
+                        except:
+                            pass
+
+                if files_deleted:
+                    print(
+                        f"🗑️ Cleaned up {len(files_deleted)} partial files: {files_deleted}"
+                    )
+
+        except Exception as e:
+            print(f"⚠️ Error cleaning up files: {e}")
+
     def retry_task(self, task):
         """Retry a failed download"""
         # Create a new task with the same parameters
         ui = self.create_download_card_ui(task.ui["title"].cget("text"))
-        
+
         new_task = DownloadTask(
             url=task.url,
             quality=task.quality,
             path=task.path,
             ui=ui,
         )
-        
+
         ui["cancel"].config(command=lambda t=new_task: self.cancel_task(t))
         ui["pause"].config(command=lambda t=new_task: self.toggle_pause_task(t))
-        
-        new_task.thread = threading.Thread(target=self.run_task, args=(new_task,), daemon=True)
+
+        new_task.thread = threading.Thread(
+            target=self.run_task, args=(new_task,), daemon=True
+        )
         new_task.thread.start()
-        
+
         self.tasks.append(new_task)
 
     def make_progress_hook(self, task):
@@ -1034,6 +1146,9 @@ class VideoDownloader:
                     title = info.get("title") or url
                     # schedule title update
                     self.root.after(0, lambda: task.ui["title"].config(text=title))
+
+                    if self.is_playlist:
+                        task.path =  os.mkdir(self.download_path+f"/{title}/")
             except Exception:
                 pass
 
@@ -1042,7 +1157,9 @@ class VideoDownloader:
 
             def ui_on_complete():
                 try:
-                    task.ui["status"].config(text="✓ Completed", fg=self.colors["accent"])
+                    task.ui["status"].config(
+                        text="✓ Completed", fg=self.colors["accent"]
+                    )
                     task.ui["percent"].config(text="100%", fg=self.colors["accent"])
                     # Hide progress elements but keep title
                     progress_parent = task.ui["progress_canvas"].master
@@ -1058,46 +1175,54 @@ class VideoDownloader:
             def ui_on_fail():
                 try:
                     if task.cancel_flag:
-                        # Make entire card gray and add strikethrough effect
-                        task.ui["card"].config(bg="#F5F5F5")
-                        task.ui["status"].config(text="✗ Cancelled", fg="#999999")
-                        
-                        # Add strikethrough effect to title
+                        # Simplified cancelled UI - only title with strikethrough
                         title_text = task.ui["title"].cget("text")
                         task.ui["title"].config(
-                            text=f"\u0336".join(title_text) + "\u0336",  # Unicode strikethrough
-                            fg="#999999"
+                            text=f"\u0336".join(title_text)
+                            + "\u0336",  # Unicode strikethrough
+                            fg="#999999",
+                            font=("Segoe UI", 11, "bold"),
                         )
-                        task.ui["percent"].config(fg="#999999")
-                        
-                        # Gray out all elements
-                        for widget_name in ["card", "progress_canvas"]:
+
+                        # Hide all other elements except title
+                        widgets_to_hide = ["percent", "speed", "status", "btn_frame"]
+                        for widget_name in widgets_to_hide:
                             if widget_name in task.ui:
                                 try:
-                                    task.ui[widget_name].config(bg="#F5F5F5")
+                                    widget = task.ui[widget_name]
+                                    if hasattr(widget, "pack_forget"):
+                                        widget.pack_forget()
+                                    elif hasattr(widget, "grid_forget"):
+                                        widget.grid_forget()
                                 except:
                                     pass
-                        
-                        task.ui["cancel"].config(bg="#CCCCCC", fg="#666666")
-                        task.ui["pause"].config(bg="#CCCCCC", fg="#666666")
+
+                        # Hide progress bar area
+                        if "progress_canvas" in task.ui:
+                            try:
+                                progress_parent = task.ui["progress_canvas"].master
+                                progress_parent.pack_forget()
+                            except:
+                                pass
+
+                        # Make card background slightly gray
+                        task.ui["card"].config(bg="#FAFAFA")
+
                     else:
-                        task.ui["status"].config(text=f"✗ Failed: {str(e)}", fg="#F44336")
-                        
+                        task.ui["status"].config(
+                            text=f"✗ Failed: {str(e)}", fg="#F44336"
+                        )
+
                         # Replace cancel button with retry button for failed downloads
                         task.ui["cancel"].config(
                             text="Retry",
                             bg="#4CAF50",
                             fg="white",
                             state=tk.NORMAL,
-                            command=lambda: self.retry_task(task)
+                            command=lambda: self.retry_task(task),
                         )
-                    
-                    task.ui["pause"].config(state=tk.DISABLED)
-                    if not task.cancel_flag:
-                        # Only disable cancel if it's not being converted to retry
-                        pass
-                    else:
-                        task.ui["cancel"].config(state=tk.DISABLED)
+                        task.ui["pause"].config(state=tk.DISABLED)
+
                 except Exception:
                     pass
 
@@ -1108,49 +1233,55 @@ class VideoDownloader:
         if not url:
             messagebox.showerror("Error", "Enter a URL")
             return
-        
+
         # Handle playlist downloads
         if self.playlist_detected and self.playlist_videos:
-            selected_videos = [v for v in self.playlist_videos if v['selected']]
+            selected_videos = [v for v in self.playlist_videos if v["selected"]]
             if not selected_videos:
-                messagebox.showwarning("No Selection", "No videos selected from playlist.")
+                messagebox.showwarning(
+                    "No Selection", "No videos selected from playlist."
+                )
                 return
-            
+
             # Download selected videos from playlist
             for video in selected_videos:
-                ui = self.create_download_card_ui(video['title'])
-                
+                ui = self.create_download_card_ui(video["title"])
+
                 task = DownloadTask(
-                    url=video['url'],
+                    url=video["url"],
                     quality=self.quality_var.get(),
                     path=self.download_path.get(),
                     ui=ui,
                 )
-                
+
                 ui["cancel"].config(command=lambda t=task: self.cancel_task(t))
                 ui["pause"].config(command=lambda t=task: self.toggle_pause_task(t))
-                
-                task.thread = threading.Thread(target=self.run_task, args=(task,), daemon=True)
+
+                task.thread = threading.Thread(
+                    target=self.run_task, args=(task,), daemon=True
+                )
                 task.thread.start()
-                
+
                 self.tasks.append(task)
         else:
             # Single video download
             ui = self.create_download_card_ui()
-            
+
             task = DownloadTask(
                 url=url,
                 quality=self.quality_var.get(),
                 path=self.download_path.get(),
                 ui=ui,
             )
-            
+
             ui["cancel"].config(command=lambda t=task: self.cancel_task(t))
             ui["pause"].config(command=lambda t=task: self.toggle_pause_task(t))
-            
-            task.thread = threading.Thread(target=self.run_task, args=(task,), daemon=True)
+
+            task.thread = threading.Thread(
+                target=self.run_task, args=(task,), daemon=True
+            )
             task.thread.start()
-            
+
             self.tasks.append(task)
 
     # minimal update check wrapper (safe)
@@ -1176,45 +1307,140 @@ class VideoDownloader:
 
     def manual_update_check(self):
         self.check_for_updates(auto=False)
-    
+
+    def setup_default_qualities(self):
+        """Setup default quality options"""
+        qualities = [
+            ("🏆 Best", "best"),
+            ("1080p", "1080"),
+            ("720p", "720"),
+            ("480p", "480"),
+            ("🎵 Audio", "audio"),
+        ]
+
+        # Clear existing radio buttons
+        for radio in self.quality_radios:
+            radio.destroy()
+        self.quality_radios.clear()
+
+        for text, value in qualities:
+            radio = tk.Radiobutton(
+                self.quality_frame,
+                text=text,
+                variable=self.quality_var,
+                value=value,
+                font=("Segoe UI", 10),
+                bg=self.colors["card"],
+                fg=self.colors["text_primary"],
+                activebackground=self.colors["card"],
+                relief=tk.FLAT,
+                bd=0,
+            )
+            radio.pack(side=tk.LEFT, padx=(0, 20))
+            self.quality_radios.append(radio)
+
+    def setup_dynamic_qualities(self, formats_info):
+        """Setup quality options based on available formats"""
+        available_qualities = set()
+
+        # Extract available qualities from formats
+        for fmt in formats_info:
+            height = fmt.get("height")
+            if height:
+                if height >= 2160:
+                    available_qualities.add(("4K (2160p)", "2160"))
+                elif height >= 1440:
+                    available_qualities.add(("1440p", "1440"))
+                elif height >= 1080:
+                    available_qualities.add(("1080p", "1080"))
+                elif height >= 720:
+                    available_qualities.add(("720p", "720"))
+                elif height >= 480:
+                    available_qualities.add(("480p", "480"))
+                elif height >= 360:
+                    available_qualities.add(("360p", "360"))
+                elif height >= 240:
+                    available_qualities.add(("240p", "240"))
+
+        # Always add these options
+        dynamic_qualities = [("🏆 Best Available", "best")]
+
+        # Add available video qualities in descending order
+        for quality_text, quality_value in sorted(
+            available_qualities, key=lambda x: int(x[1]), reverse=True
+        ):
+            dynamic_qualities.append((quality_text, quality_value))
+
+        # Always add audio option
+        dynamic_qualities.append(("🎵 Audio Only", "audio"))
+
+        # Update UI
+        self.root.after(0, lambda: self._update_quality_ui(dynamic_qualities))
+
+    def _update_quality_ui(self, qualities):
+        """Update quality radio buttons in main thread"""
+        # Clear existing radio buttons
+        for radio in self.quality_radios:
+            radio.destroy()
+        self.quality_radios.clear()
+
+        # Add new radio buttons
+        for text, value in qualities:
+            radio = tk.Radiobutton(
+                self.quality_frame,
+                text=text,
+                variable=self.quality_var,
+                value=value,
+                font=("Segoe UI", 10),
+                bg=self.colors["card"],
+                fg=self.colors["text_primary"],
+                activebackground=self.colors["card"],
+                relief=tk.FLAT,
+                bd=0,
+            )
+            radio.pack(side=tk.LEFT, padx=(0, 15))
+            self.quality_radios.append(radio)
+
     def show_playlist_selection(self):
         """Show a window to select videos from a playlist"""
         if not self.playlist_videos:
             messagebox.showwarning("No Playlist", "Please fetch a playlist first.")
             return
-        
+
         # Create selection window
         selection_window = tk.Toplevel(self.root)
         selection_window.title("Select Videos from Playlist")
-        selection_window.geometry("600x500")
+        selection_window.geometry("700x500")
         selection_window.configure(bg=self.colors["background"])
         selection_window.transient(self.root)
         selection_window.grab_set()
-        
+
         # Center the window
-        selection_window.geometry("+%d+%d" % (self.root.winfo_rootx() + 50, self.root.winfo_rooty() + 50))
-        
+        selection_window.geometry(
+            "+%d+%d" % (self.root.winfo_rootx() + 50, self.root.winfo_rooty() + 50)
+        )
+
         # Title
         title_frame = tk.Frame(selection_window, bg=self.colors["primary"], height=60)
         title_frame.pack(fill=tk.X)
         title_frame.pack_propagate(False)
-        
+
         tk.Label(
             title_frame,
             text="🎬 Select Videos to Download",
             font=("Segoe UI", 16, "bold"),
             bg=self.colors["primary"],
-            fg="white"
+            fg="white",
         ).pack(pady=15)
-        
+
         # Main content frame
         content_frame = tk.Frame(selection_window, bg=self.colors["background"])
         content_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
-        
+
         # Action buttons frame
         action_frame = tk.Frame(content_frame, bg=self.colors["background"])
         action_frame.pack(fill=tk.X, pady=(0, 10))
-        
+
         select_all_btn = tk.Button(
             action_frame,
             text="Select All",
@@ -1224,10 +1450,10 @@ class VideoDownloader:
             fg="white",
             relief=tk.FLAT,
             cursor="hand2",
-            padx=15
+            padx=15,
         )
         select_all_btn.pack(side=tk.LEFT, padx=(0, 10))
-        
+
         deselect_all_btn = tk.Button(
             action_frame,
             text="Deselect All",
@@ -1237,92 +1463,91 @@ class VideoDownloader:
             fg="white",
             relief=tk.FLAT,
             cursor="hand2",
-            padx=15
+            padx=15,
         )
         deselect_all_btn.pack(side=tk.LEFT)
-        
+
         # Scrollable list
-        canvas = tk.Canvas(content_frame, bg=self.colors["background"], highlightthickness=0)
-        scrollbar = ttk.Scrollbar(content_frame, orient="vertical", command=canvas.yview)
-        scrollable_frame = tk.Frame(canvas, bg=self.colors["background"])
-        
-        scrollable_frame.bind(
-            "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        canvas = tk.Canvas(
+            content_frame, bg=self.colors["background"], highlightthickness=0
         )
-        
+        scrollbar = ttk.Scrollbar(
+            content_frame, orient="vertical", command=canvas.yview
+        )
+        scrollable_frame = tk.Frame(canvas, bg=self.colors["background"])
+
+        scrollable_frame.bind(
+            "<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+
         canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
         canvas.configure(yscrollcommand=scrollbar.set)
-        
+
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        
+
         # Add videos to selection list
         video_vars = []
         for i, video in enumerate(self.playlist_videos):
-            var = tk.BooleanVar(value=video['selected'])
+            var = tk.BooleanVar(value=video["selected"])
             video_vars.append(var)
-            
+
             # Video card
             video_card = tk.Frame(
-                scrollable_frame,
-                bg=self.colors["card"],
-                relief=tk.FLAT,
-                bd=0
+                scrollable_frame, bg=self.colors["card"], relief=tk.FLAT, bd=0
             )
             video_card.pack(fill=tk.X, pady=5)
             video_card.configure(
-                highlightbackground=self.colors["border"],
-                highlightthickness=1
+                highlightbackground=self.colors["border"], highlightthickness=1
             )
-            
+
             video_inner = tk.Frame(video_card, bg=self.colors["card"])
             video_inner.pack(fill=tk.X, padx=15, pady=10)
-            
+
             # Checkbox and title
             check_frame = tk.Frame(video_inner, bg=self.colors["card"])
             check_frame.pack(fill=tk.X)
-            
+
             checkbox = tk.Checkbutton(
                 check_frame,
                 variable=var,
                 bg=self.colors["card"],
                 activebackground=self.colors["card"],
-                relief=tk.FLAT
+                relief=tk.FLAT,
             )
             checkbox.pack(side=tk.LEFT, padx=(0, 10))
-            
+
             title_label = tk.Label(
                 check_frame,
-                text=video['title'],
+                text=video["title"],
                 font=("Segoe UI", 10, "bold"),
                 bg=self.colors["card"],
                 fg=self.colors["text_primary"],
                 anchor="w",
-                wraplength=450
+                wraplength=450,
             )
             title_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
-            
+
             # Duration
-            if video['duration']:
-                duration = video['duration']
+            if video["duration"]:
+                duration = video["duration"]
                 m, s = divmod(int(duration), 60)
                 h, m = divmod(m, 60)
                 duration_text = f"{h:d}h {m:d}m {s:d}s" if h else f"{m:d}m {s:d}s"
-                
+
                 duration_label = tk.Label(
                     check_frame,
                     text=duration_text,
                     font=("Segoe UI", 9),
                     bg=self.colors["card"],
-                    fg=self.colors["text_secondary"]
+                    fg=self.colors["text_secondary"],
                 )
                 duration_label.pack(side=tk.RIGHT)
-        
+
         # Bottom buttons
         bottom_frame = tk.Frame(content_frame, bg=self.colors["background"])
         bottom_frame.pack(fill=tk.X, pady=(20, 0))
-        
+
         cancel_btn = tk.Button(
             bottom_frame,
             text="Cancel",
@@ -1333,24 +1558,26 @@ class VideoDownloader:
             relief=tk.FLAT,
             cursor="hand2",
             padx=20,
-            pady=8
+            pady=8,
         )
         cancel_btn.pack(side=tk.RIGHT, padx=(10, 0))
-        
+
         confirm_btn = tk.Button(
             bottom_frame,
-            text="Confirm Selection",
-            command=lambda: self.confirm_playlist_selection(video_vars, selection_window),
+            text="Confirm",
+            command=lambda: self.confirm_playlist_selection(
+                video_vars, selection_window
+            ),
             font=("Segoe UI", 11, "bold"),
             bg=self.colors["primary"],
             fg="white",
             relief=tk.FLAT,
             cursor="hand2",
             padx=20,
-            pady=8
+            pady=8,
         )
         confirm_btn.pack(side=tk.RIGHT)
-        
+
         # Bind mousewheel to canvas
         def _on_mousewheel(event):
             try:
@@ -1361,41 +1588,45 @@ class VideoDownloader:
             except tk.TclError:
                 # Canvas has been destroyed, ignore the event
                 pass
-        
+
         # Bind to the canvas specifically instead of bind_all to prevent issues when window is closed
         canvas.bind("<MouseWheel>", _on_mousewheel)
         canvas.bind("<Button-4>", _on_mousewheel)
         canvas.bind("<Button-5>", _on_mousewheel)
-        
+
         # Also bind to the selection window to ensure mouse events are captured
         selection_window.bind("<MouseWheel>", _on_mousewheel)
         selection_window.bind("<Button-4>", _on_mousewheel)
         selection_window.bind("<Button-5>", _on_mousewheel)
-    
+
     def toggle_all_videos(self, select_all, video_vars):
         """Select or deselect all videos"""
         for var in video_vars:
             var.set(select_all)
-    
+
     def confirm_playlist_selection(self, video_vars, window):
         """Confirm the playlist selection and update the video list"""
         selected_count = 0
         for i, var in enumerate(video_vars):
-            self.playlist_videos[i]['selected'] = var.get()
+            self.playlist_videos[i]["selected"] = var.get()
             if var.get():
                 selected_count += 1
-        
+
         if selected_count == 0:
-            messagebox.showwarning("No Selection", "Please select at least one video to download.")
+            messagebox.showwarning(
+                "No Selection", "Please select at least one video to download."
+            )
             return
-        
+
         # Update sidebar info
         self.sidebar_meta.config(
             text=f"Selected: {selected_count}/{len(self.playlist_videos)}\nReady to download"
         )
-        
+
         window.destroy()
-        messagebox.showinfo("Selection Confirmed", f"Selected {selected_count} videos for download.")
+        messagebox.showinfo(
+            "Selection Confirmed", f"Selected {selected_count} videos for download."
+        )
 
 
 def main():
